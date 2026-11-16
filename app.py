@@ -7,11 +7,13 @@ import yt_dlp
 
 app = Flask(__name__)
 
+# ВОТ ТВОЙ КЛЮЧ - МЕСТО 1
+API_KEY = "axtem12345"
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# Удаляем старые файлы старше 1 часа, чтобы не забивать Render
 def cleanup_old_files():
     while True:
         try:
@@ -28,7 +30,7 @@ threading.Thread(target=cleanup_old_files, daemon=True).start()
 
 @app.route("/")
 def home():
-    return jsonify({"ok": True, "service": "youaxtem-api"})
+    return jsonify({"ok": True})
 
 @app.route("/api/health")
 def health():
@@ -36,6 +38,10 @@ def health():
 
 @app.route("/api/download", methods=["POST"])
 def download():
+    # Проверка ключа
+    if request.headers.get("X-API-Key") != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url", "").strip()
 
@@ -59,11 +65,8 @@ def download():
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         },
-        # Пробуем разные клиенты YouTube, если один заблокирован
         "extractor_args": {
-            "youtube": {
-                "player_client": ["android", "web", "ios"]
-            }
+            "youtube": {"player_client": ["android", "web", "ios"]}
         },
     }
 
@@ -71,24 +74,16 @@ def download():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
             title = info.get("title", "video")
-            # Находим скачанный файл
             filename = None
             for f in os.listdir(DOWNLOAD_DIR):
                 if f.startswith(file_id):
                     filename = f
                     break
-
             if not filename:
-                return jsonify({"error": "file not found after download"}), 500
+                return jsonify({"error": "file not found"}), 500
 
             download_url = request.host_url + "files/" + filename
-            return jsonify({
-                "ok": True,
-                "title": title,
-                "filename": filename,
-                "downloadUrl": download_url
-            })
-
+            return jsonify({"ok": True, "title": title, "filename": filename, "downloadUrl": download_url})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
