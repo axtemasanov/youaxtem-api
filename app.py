@@ -1,113 +1,91 @@
-from flask import Flask, request, jsonify
-import requests
 import os
+import re
+import subprocess
+import uuid
+from pathlib import Path
+from urllib.parse import urlparse
+
+from flask import Flask, jsonify, request, send_from_directory
 
 app = Flask(__name__)
+DOWNLOAD_DIR = Path(__file__).parent / "downloads"
+DOWNLOAD_DIR.mkdir(exist_ok=True)
+API_KEY = os.environ.get("YOUAXTEM_API_KEY", "change-me")
+MAX_FILE_SIZE = "500M"
 
-PIPED_HOSTS = [
-    "pipedapi.kavin.rocks",
-    "pipedapi.adminforge.de",
-    "pipedapi.reallyaweso.me",
-    "pipedapi.drgns.space",
-    "pipedapi.leptons.xyz",
-    "pipedapi.ducks.party",
-    "pipedapi-libre.kavin.rocks",
-]
+YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
 
-INVIDIOUS_HOSTS = [
-    "inv.nadeko.net",
-    "yewtu.be",
-    "invidious.jing.rocks",
-    "iv.melmac.space",
-]
-
-@app.route('/')
-def home():
-    return "youaxtem API v3 is alive!"
-
-@app.route('/get')
-def get_video():
-    url = request.args.get('url')
-    if not url:
-        return jsonify({"error": "no url"}), 400
-
-    # вытаскиваем ID
-    video_id = url
-    if "v=" in url:
-        video_id = url.split("v=")[1].split("&")[0].split("?")[0]
-    elif "youtu.be/" in url:
-        video_id = url.split("youtu.be/")[1].split("?")[0].split("&")[0]
-    elif "shorts/" in url:
-        video_id = url.split("shorts/")[1].split("?")[0].split("/")[0]
-
-    # === 1. PIPED ===
-    for host in PIPED_HOSTS:
-        try:
-            r = requests.get(f"https://{host}/streams/{video_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                streams = data.get("videoStreams", [])
-                # ищем mp4 с аудио
-                best = None
-                for s in streams:
-                    if s.get("format") == "MP4" and s.get("audio"):
-                        best = s.get("url")
-                        break
-                if not best and streams:
-                    best = streams[0].get("url")
-                if best:
-                    return jsonify({
-                        "title": data.get("title", "video"),
-                        "url": best,
-                        "thumbnail": data.get("thumbnail", ""),
-                        "source": f"piped-{host}"
-                    })
-        except Exception as e:
-            print(f"piped {host} fail: {e}")
-            continue
-
-    # === 2. INVIDIOUS ===
-    for host in INVIDIOUS_HOSTS:
-        try:
-            r = requests.get(f"https://{host}/api/v1/videos/{video_id}", timeout=10, headers={"User-Agent": "Mozilla/5.0"})
-            if r.status_code == 200:
-                data = r.json()
-                formats = data.get("formatStreams", []) or data.get("formats", [])
-                best = None
-                for f in formats:
-                    if "mp4" in f.get("type", ""):
-                        best = f.get("url")
-                        break
-                if best:
-                    return jsonify({
-                        "title": data.get("title", "video"),
-                        "url": best,
-                        "thumbnail": data.get("videoThumbnails", [{}])[0].get("url", ""),
-                        "source": f"invidious-{host}"
-                    })
-        except Exception as e:
-            print(f"invidious {host} fail: {e}")
-            continue
-
-    # === 3. COBALT ===
+def is_youtube_url(value: str) -> bool:
     try:
-        r = requests.post(
-            "https://api.cobalt.tools/api/json",
-            json={"url": f"https://www.youtube.com/watch?v={video_id}", "videoQuality": "720", "download": True},
-            headers={"Content-Type": "application/json"},
-            timeout=30
-        )
-        data = r.json()
-        if data.get("url"):
-            return jsonify({
-                "title": data.get("filename", "video").rsplit('.', 1)[0],
-                "url": data.get("url"),
-                "source": "cobalt"
-            })
-    except Exception as e:
-        print(f"cobalt fail: {e}")
+        host = urlparse(value).hostname
+        return host is not None and host.lower() in YOUTUBE_HOSTS
+    except Exception:
+        return False
 
-    return jsonify({"error": "all methods failed"}), 500
+def safe_job_name() -> str:
+    return re.sub(r"[^a-zA-Z0-9_-]", "", uuid.uuid4().hex)
+
+@app.get("/")
+def home():
+    return jsonify({"ok": True, "msg": "youaxtem API Termux version is alive!"})
+
+@app.get("/api/health")
+def health():
+    return jsonify({"ok": True})
+
+@app.post("/api/download")
+def download_video():
+    if request.headers.get("X-API-Key", "") != API_KEY:
+        return jsonify({"error": "unauthorized"}), 401
+
+    body = request.get_json(silent=True) or {}
+    source = str(body.get("url", "")).strip()
+    if not source or not is_youtube_url(source):
+        return jsonify({"error": "Нужна публичная ссылка YouTube"}), 400
+
+    job = safe_job_name()
+    output_template = str(DOWNLOAD_DIR / (job + ".%(ext)s"))
+    command = [
+        "yt-dlp",
+        "--no-playlist",
+        "--max-filesize", MAX_FILE_SIZE,
+        "--merge-output-format", "mp4",
+        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
+        "--print", "after_move:filepath",
+        "-o", output_template,
+        source,
+    ]
+
+    try:
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=15 * 60,
+            check=False,
+        )
+    except FileNotFoundError:
+        return jsonify({"error": "На сервере не установлен yt-dlp"}), 500
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Загрузка заняла слишком много времени"}), 504
+
+    if result.returncode != 0:
+        error = (result.stderr or result.stdout or "yt-dlp error").strip()[-1000:]
+        return jsonify({"error": error}), 502
+
+    files = sorted(DOWNLOAD_DIR.glob(job + ".*"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not files:
+        return jsonify({"error": "Файл не был создан"}), 500
+
+    file_path = files[0]
+    return jsonify({
+        "title": file_path.stem,
+        "downloadUrl": request.host_url.rstrip("/") + "/files/" + file_path.name,
+    })
+
+@app.get("/files/<path:name>")
+def serve_file(name: str):
+    return send_from_directory(DOWNLOAD_DIR, name, as_attachment=True)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
