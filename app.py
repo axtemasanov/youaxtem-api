@@ -1,93 +1,101 @@
 import os
-import re
-import subprocess
 import uuid
-from pathlib import Path
-from urllib.parse import urlparse
-
-from flask import Flask, jsonify, request, send_from_directory
+import threading
+import time
+from flask import Flask, request, jsonify, send_from_directory
+import yt_dlp
 
 app = Flask(__name__)
-DOWNLOAD_DIR = Path(__file__).parent / "downloads"
-DOWNLOAD_DIR.mkdir(exist_ok=True)
-API_KEY = os.environ.get("YOUAXTEM_API_KEY", "change-me")
-MAX_FILE_SIZE = "500M"
 
-YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "www.youtu.be"}
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-def is_youtube_url(value: str) -> bool:
-    try:
-        host = urlparse(value).hostname
-        return host is not None and host.lower() in YOUTUBE_HOSTS
-    except Exception:
-        return False
+# Удаляем старые файлы старше 1 часа, чтобы не забивать Render
+def cleanup_old_files():
+    while True:
+        try:
+            now = time.time()
+            for f in os.listdir(DOWNLOAD_DIR):
+                path = os.path.join(DOWNLOAD_DIR, f)
+                if os.path.isfile(path) and now - os.path.getmtime(path) > 3600:
+                    os.remove(path)
+        except:
+            pass
+        time.sleep(600)
 
-def safe_job_name() -> str:
-    return re.sub(r"[^a-zA-Z0-9_-]", "", uuid.uuid4().hex)
+threading.Thread(target=cleanup_old_files, daemon=True).start()
 
-@app.get("/")
+@app.route("/")
 def home():
-    return jsonify({"ok": True, "msg": "youaxtem API Termux version is alive!"})
+    return jsonify({"ok": True, "service": "youaxtem-api"})
 
-@app.get("/api/health")
+@app.route("/api/health")
 def health():
     return jsonify({"ok": True})
 
-@app.post("/api/download")
-def download_video():
-    if request.headers.get("X-API-Key", "") != API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
+@app.route("/api/download", methods=["POST"])
+def download():
+    data = request.get_json(force=True, silent=True) or {}
+    url = data.get("url", "").strip()
 
-    body = request.get_json(silent=True) or {}
-    source = str(body.get("url", "")).strip()
-    if not source or not is_youtube_url(source):
-        return jsonify({"error": "Нужна публичная ссылка YouTube"}), 400
+    if not url:
+        return jsonify({"error": "no url"}), 400
 
-    job = safe_job_name()
-    output_template = str(DOWNLOAD_DIR / (job + ".%(ext)s"))
-    command = [
-        "yt-dlp",
-        "--no-playlist",
-        "--max-filesize", MAX_FILE_SIZE,
-        "--merge-output-format", "mp4",
-        "-f", "bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/b",
-        "--print", "after_move:filepath",
-        "-o", output_template,
-        source,
-    ]
+    if "youtube.com" not in url and "youtu.be" not in url:
+        return jsonify({"error": "only youtube links"}), 400
+
+    file_id = uuid.uuid4().hex[:12]
+    out_template = os.path.join(DOWNLOAD_DIR, file_id + ".%(ext)s")
+
+    ydl_opts = {
+        "format": "best[ext=mp4]/best",
+        "outtmpl": out_template,
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+        "socket_timeout": 60,
+        "retries": 3,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        },
+        # Пробуем разные клиенты YouTube, если один заблокирован
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "web", "ios"]
+            }
+        },
+    }
 
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=15 * 60,
-            check=False,
-        )
-    except FileNotFoundError:
-        return jsonify({"error": "На сервере не установлен yt-dlp"}), 500
-    except subprocess.TimeoutExpired:
-        return jsonify({"error": "Загрузка заняла слишком много времени"}), 504
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            title = info.get("title", "video")
+            # Находим скачанный файл
+            filename = None
+            for f in os.listdir(DOWNLOAD_DIR):
+                if f.startswith(file_id):
+                    filename = f
+                    break
 
-    if result.returncode != 0:
-        error = (result.stderr or result.stdout or "yt-dlp error").strip()[-1000:]
-        return jsonify({"error": error}), 502
+            if not filename:
+                return jsonify({"error": "file not found after download"}), 500
 
-    files = sorted(DOWNLOAD_DIR.glob(job + ".*"), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        return jsonify({"error": "Файл не был создан"}), 500
+            download_url = request.host_url + "files/" + filename
+            return jsonify({
+                "ok": True,
+                "title": title,
+                "filename": filename,
+                "downloadUrl": download_url
+            })
 
-    file_path = files[0]
-    return jsonify({
-        "title": file_path.stem,
-        "downloadUrl": request.host_url.rstrip("/") + "/files/" + file_path.name,
-    })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.get("/files/<path:name>")
-def serve_file(name: str):
-    return send_from_directory(DOWNLOAD_DIR, name, as_attachment=True)
+@app.route("/files/<path:filename>")
+def serve_file(filename):
+    return send_from_directory(DOWNLOAD_DIR, filename, as_attachment=True)
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    print(f"YOU_AXTEM server: http://0.0.0.0:{port}")
-    app.run(host="0.0.0.0", port=port, threaded=True)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
