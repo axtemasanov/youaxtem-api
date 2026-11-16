@@ -7,9 +7,6 @@ import yt_dlp
 
 app = Flask(__name__)
 
-# ВОТ ТВОЙ КЛЮЧ - МЕСТО 1
-API_KEY = "axtem12345"
-
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DOWNLOAD_DIR = os.path.join(BASE_DIR, "downloads")
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
@@ -38,10 +35,7 @@ def health():
 
 @app.route("/api/download", methods=["POST"])
 def download():
-    # Проверка ключа
-    if request.headers.get("X-API-Key") != API_KEY:
-        return jsonify({"error": "unauthorized"}), 401
-
+    # КЛЮЧА БОЛЬШЕ НЕТ ВООБЩЕ
     data = request.get_json(force=True, silent=True) or {}
     url = data.get("url", "").strip()
 
